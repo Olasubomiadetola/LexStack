@@ -203,3 +203,186 @@
         )
     )
 )
+
+;; Add signature to contract
+(define-public (add-signature
+    (contract-id uint)
+    (signature-hash (buff 64)))
+    (let
+        ((contract-opt (map-get? legal-contracts { contract-id: contract-id })))
+        (begin
+            ;; Validate contract exists
+            (asserts! (is-some contract-opt) ERR_CONTRACT_NOT_FOUND)
+
+            (let ((contract-data (unwrap! contract-opt ERR_CONTRACT_NOT_FOUND))
+                  (current-version-opt (get-latest-version contract-id)))
+
+                ;; Validate version exists
+                (asserts! (is-some current-version-opt) ERR_VERSION_NOT_FOUND)
+                (let ((current-version (unwrap! current-version-opt ERR_VERSION_NOT_FOUND)))
+
+                    ;; Validate input
+                    (asserts! (validate-signature-hash signature-hash) ERR_INVALID_INPUT)
+
+                    ;; Validate contract is active
+                    (asserts! (is-eq (get status contract-data) CONTRACT_ACTIVE) ERR_INVALID_STATE)
+
+                    ;; Check if already signed
+                    (asserts! (is-none (map-get? contract-signatures 
+                        { contract-id: contract-id, signer: tx-sender })) ERR_INVALID_STATE)
+
+                    ;; Add signature
+                    (map-set contract-signatures
+                        { contract-id: contract-id, signer: tx-sender }
+                        {
+                            signed-at: block-height,
+                            signature-hash: signature-hash,
+                            version: current-version
+                        }
+                    )
+
+                    ;; Log event
+                    (unwrap! (log-contract-event 
+                        contract-id 
+                        "signature_added" 
+                        "Signature added"
+                        (some tx-sender)
+                        (some current-version))
+                        ERR_EVENT_FAILED)
+
+                    (ok true)
+                )
+            )
+        )
+    )
+)
+
+;; Get contract details
+(define-public (get-contract-details (contract-id uint))
+    (match (map-get? legal-contracts { contract-id: contract-id })
+        contract-data (ok contract-data)
+        ERR_CONTRACT_NOT_FOUND
+    )
+)
+
+;; Create new version of contract
+(define-public (create-version
+    (contract-id uint)
+    (content-hash (buff 32))
+    (metadata (string-ascii 256)))
+    (let
+        ((current-version-opt (get-latest-version contract-id)))
+        (begin
+            ;; Validate contract exists and get current version
+            (asserts! (validate-contract-exists contract-id) ERR_CONTRACT_NOT_FOUND)
+            (asserts! (is-some current-version-opt) ERR_VERSION_NOT_FOUND)
+
+            ;; Validate inputs
+            (asserts! (validate-content-hash content-hash) ERR_INVALID_INPUT)
+            (asserts! (validate-metadata metadata) ERR_INVALID_INPUT)
+
+            ;; Verify permissions
+            (asserts! (is-contract-admin contract-id tx-sender) ERR_NOT_AUTHORIZED)
+
+            (let ((current-version (unwrap! current-version-opt ERR_VERSION_NOT_FOUND)))
+                ;; Create new version
+                (map-set contract-versions
+                    { contract-id: contract-id, version: (+ current-version u1) }
+                    {
+                        content-hash: content-hash,
+                        created-by: tx-sender,
+                        created-at: block-height,
+                        metadata: metadata
+                    }
+                )
+
+                ;; Update contract timestamp
+                (try! (update-contract-timestamp contract-id))
+
+                ;; Log event
+                (unwrap! (log-contract-event 
+                    contract-id 
+                    "version_created" 
+                    metadata
+                    (some tx-sender)
+                    (some (+ current-version u1)))
+                    ERR_EVENT_FAILED)
+
+                (ok true)
+            )
+        )
+    )
+)
+
+;; Grant access to contract
+(define-public (grant-access
+    (contract-id uint)
+    (user principal)
+    (access-level uint))
+    (begin
+        ;; Validate contract exists
+        (asserts! (validate-contract-exists contract-id) ERR_CONTRACT_NOT_FOUND)
+
+        ;; Verify admin permissions
+        (asserts! (is-contract-admin contract-id tx-sender) ERR_NOT_AUTHORIZED)
+
+        ;; Validate access level
+        (asserts! (<= access-level ACCESS_LEVEL_ADMIN) ERR_INVALID_INPUT)
+
+        ;; Validate user principal
+        (asserts! (validate-user-principal user) ERR_INVALID_INPUT)
+
+        ;; Check if user already has access
+        (match (map-get? contract-access { contract-id: contract-id, user: user })
+            existing-access 
+            (asserts! (not (is-eq (get access-level existing-access) access-level)) ERR_INVALID_STATE)
+            true
+        )
+
+        ;; Grant access
+        (map-set contract-access
+            { contract-id: contract-id, user: user }
+            { access-level: access-level }
+        )
+
+        ;; Log event with validated user principal
+        (let ((validated-user user))
+            (unwrap! (log-contract-event 
+                contract-id 
+                "access_granted" 
+                "Access granted"
+                (some validated-user)
+                (some access-level))
+                ERR_EVENT_FAILED)
+        )
+
+        (ok true)
+    )
+)
+
+;; Helper Functions
+
+;; Get latest version number for contract
+(define-private (get-latest-version (contract-id uint))
+    (match (map-get? legal-contracts { contract-id: contract-id })
+        contract-data 
+            (let ((version u0))
+                (some version)
+            )
+        none
+    )
+)
+
+;; Update contract timestamp
+(define-private (update-contract-timestamp (contract-id uint))
+    (match (map-get? legal-contracts { contract-id: contract-id })
+        contract-data (begin
+            (map-set legal-contracts
+                { contract-id: contract-id }
+                (merge contract-data { updated-at: block-height })
+            )
+            (ok true)
+        )
+        ERR_CONTRACT_NOT_FOUND
+    )
+)
